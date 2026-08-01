@@ -1,0 +1,22 @@
+{
+  "name": "Litematic-Importer-WS-For-MCBE",
+  "version": "1.0.0",
+  "description": "通过 WebSocket 将 Litematica 建筑投影导入 Minecraft 基岩版",
+  "main": "litematic.js",
+  "author": "StarAwA117",
+  "license": "MIT",
+  "type": "module",
+  "scripts": {
+    "start": "node litematic.js"
+  },
+  "dependencies": {
+    "ws": "^8.18.0"
+  },
+  "keywords": [
+    "minecraft",
+    "bedrock-edition",
+    "litematica",
+    "websocket",
+    "builder"
+  ]
+}
