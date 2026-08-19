@@ -53,16 +53,77 @@ node litematic.js 8080
 | X | int | 否 | 目标 X 坐标（留空则使用玩家当前位置） |
 | Y | int | 否 | 目标 Y 坐标 |
 | Z | int | 否 | 目标 Z 坐标 |
+| 模式 | string | 否 | `trim`（默认）：裁剪底部空气层，建筑底部对齐放置点；`raw`：保留原始高度偏移 |
+
+> **底部空气层说明**：Litematic 文件的区域高度通常包含大量空白空气（建筑底部可能悬空数层甚至几十层）。默认 `trim` 模式会自动检测并裁剪这些空气层，让建筑紧贴放置点地面，避免悬空和破坏地形。使用 `raw` 可保留原始偏移。
 
 **示例：**
 
 ```
 $create my_house
 $create my_house 100 64 200
-$create "my house" 100 64 200
+$create my_house 100 64 200 raw
+$create "my house" raw
 ```
 
-执行后会显示预览信息（尺寸、方块数、预计耗时），输入 `$y` 确认后开始导入。
+执行后会显示预览信息（尺寸、方块数、底部空气层、预计耗时），输入 `$y` 确认后开始导入。
+
+### $preview
+
+在不放置方块的情况下预览建筑的位置和轮廓（FMBE 风格虚拟预览）。
+
+| 参数 | 类型 | 必需 | 说明 |
+|------|------|------|------|
+| 文件名 | string | 是 | litematic 文件名 |
+| X | int | 否 | 目标 X 坐标（留空则使用玩家当前位置） |
+| Y | int | 否 | 目标 Y 坐标 |
+| Z | int | 否 | 目标 Z 坐标 |
+| 模式 | string | 否 | `trim`（默认）/ `raw`，同 `$create` |
+
+预览效果：
+- **粒子边框** — 建筑底部与四角的熔岩粒子轮廓（约每 4 秒刷新一次）
+- **实体标记** — 8 个角点（`✦`）与边框点（`▪`）的悬浮标记，以及顶部信息标签，持续显示
+- 聊天栏显示尺寸、实际放置范围与底部空气层数
+
+> 实体标记使用 `text_display` 实体，需要 Minecraft 1.19.60+（粒子边框任意支持 WebSocket 的版本均可用）。
+
+**示例：**
+
+```
+$preview my_house
+$preview my_house 100 64 200
+```
+
+### $unpreview
+
+清除当前建筑预览（移除所有标记实体并停止粒子刷新）。
+
+```
+$unpreview
+```
+
+### $export
+
+将 Litematic 导出为 Minecraft 基岩版结构文件 `.mcstructure`，可在游戏内用结构方块预览和放置。
+
+| 参数 | 类型 | 必需 | 说明 |
+|------|------|------|------|
+| 文件名 | string | 是 | litematic 文件名 |
+| 导出名 | string | 否 | 导出文件名（默认与 litematic 同名） |
+| 模式 | string | 否 | `trim`（默认）/ `raw`，同 `$create` |
+
+导出文件写入项目目录的 `structures/` 文件夹。使用方式：
+
+1. 将 `.mcstructure` 文件放入行为包的 `structures` 文件夹（如 `BP/structures/mystructure/`）或单机存档的 `structures` 文件夹
+2. 游戏内用结构方块加载预览，或执行 `/structure load <名称>`
+
+**示例：**
+
+```
+$export my_house
+$export my_house castle
+$export my_house castle raw
+```
 
 ### $list
 
@@ -123,6 +184,9 @@ $search house 2
 - **智能指令优化** — 自动合并相邻同种方块为 fill 指令
 - **无需本地存档** — 通过 WebSocket 连接任意正在运行的世界
 - **自动常加载区块** — 导入期间自动创建和删除 ticking area
+- **空气层自动裁剪** — 检测并裁剪建筑底部的空白空气层，避免悬空与破坏地形
+- **虚拟预览** — 粒子边框 + 实体标记，放置前确认建筑位置和大小
+- **结构文件导出** — 一键导出 `.mcstructure`，可用结构方块预览放置
 
 ## License
 
