@@ -4,7 +4,7 @@
 // Litematic Importer WS For MCBE
 // 通过 WebSocket 将 Litematica 建筑投影导入 Minecraft 基岩版
 //
-// 功能概览:
+//   命令：
 //   $create     导入建筑投影（支持裁剪底部空气层）
 //   $preview    粒子边框 + 实体标记预览建筑位置
 //   $export     导出为 .mcstructure 结构文件
