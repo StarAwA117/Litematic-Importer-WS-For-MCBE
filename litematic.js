@@ -1,27 +1,75 @@
 // Author: StarAwA117 & Hydrooxygen
-// Current Branch's author is Hydrooxygen
-//
 // Litematic Importer WS For MCBE
 // 通过 WebSocket 将 Litematica 建筑投影导入 Minecraft 基岩版
 //
-//   命令：
+//   命令（游戏内聊天栏或运行脚本的终端中均可使用）：
+//   $help       查看所有命令
 //   $create     导入建筑投影（支持裁剪底部空气层）
 //   $preview    粒子边框 + 实体标记预览建筑位置
+//   $unpreview  清除建筑预览
 //   $export     导出为 .mcstructure 结构文件
 //   $list/$search 浏览建筑文件
 //   $y/$n       确认 / 取消导入
 //   $status     查看导入进度
+//   $author     作者信息
+//   注：每条命令的详细用法、参数与 trim/raw 模式说明
+//       统一维护在下方 COMMAND_DEFS 表中，$help 输出自动读取。
+//
+//   终端操作：提示符 litematic>，输入 exit 退出；
+//   需要游戏连接的操作自动委托给当前活跃的 WebSocket 连接。
 
 import fs from "fs";
 import path from "path";
 import zlib from "zlib";
 import crypto from "crypto";
+import readline from "readline"; // 终端交互（在终端中直接执行命令）
 import WebSocket, { WebSocketServer } from "ws";
 
 const LITEMATIC_DIR = "./litematic"; // litematic 文件存放目录
 const PREFIX = "$"; // 游戏内命令前缀
 const PORT = Number(process.argv[2]) || 8080; // 端口号，可通过命令行参数指定
 const { OPEN } = WebSocket; // WebSocket 连接状态常量
+
+// ==================== 命令帮助信息表 is here ====================
+// help指令格式: $help [命令名(可选)]
+const COMMAND_DEFS = {
+	help: { desc: "查看命令用法", params: [["命令名", true, "要查看的命令名，可以留空列出全部命令用法"]] },
+	create: {
+		desc: "导入 Litematic 文件建筑投影",
+		params: [
+			["文件名", false, "litematic 文件名"],
+			["X", true, "放置点 X 坐标（留空使用玩家位置）"],
+			["Y", true, "放置点 Y 坐标"],
+			["Z", true, "放置点 Z 坐标"],
+			["模式", true, "trim=裁剪底部空气对齐地面(默认), raw=保留原始高度偏移"]
+		]
+	},
+	preview: {
+		desc: "预览建筑位置与轮廓",
+		params: [
+			["投影文件名", false, "litematic"],
+			["X", true, "放置点 X 坐标（留空使用玩家位置）"],
+			["Y", true, "放置点 Y 坐标"],
+			["Z", true, "放置点 Z 坐标"],
+			["模式", true, "trim=裁剪底部空气对齐地面(默认), raw=保留原始高度偏移"]
+		]
+	},
+	unpreview: { desc: "清除建筑预览", params: [] },
+	export: {
+		desc: "导出为MCBE结构方块文件 (.mcstructure)",
+		params: [
+			["文件名", false, "投影文件名"],
+			["导出名", true, "导出文件名（留空则与源文件同名）"],
+			["模式", true, "trim=裁剪底部空气(默认推荐), raw=保留原始高度偏移"]
+		]
+	},
+	list: { desc: "查看建筑文件列表", params: [["页码", true, "页码（每页 5 个，默认第 1 页）"]] },
+	search: { desc: "搜索建筑文件", params: [["关键词", false, "搜索关键词（不区分大小写）"], ["页码", true, "页码（默认第 1 页）"]] },
+	y: { desc: "确认导入", params: [] },
+	n: { desc: "取消/中断导入", params: [] },
+	author: { desc: "查看作者信息", params: [] },
+	status: { desc: "查看导入进度", params: [] }
+};
 
 // 将长字符串按字节数分割成多个小段
 // 原因: 游戏聊天栏 / 命令对单条消息长度有限制，超长消息需要分段发送
@@ -62,8 +110,9 @@ class Command {
 		this.fn = null;
 	}
 	// 添加参数定义，返回 this 支持链式调用
-	add(type, opt = false) {
-		this.params.push([type, opt]);
+	// type: 参数名（"文件名"/"X"/"模式"等）；opt: 是否可选；desc: 参数说明（用于 $help）
+	add(type, opt = false, desc = "") {
+		this.params.push([type, opt, desc]);
 		return this;
 	}
 	// 设置命令处理函数
@@ -101,8 +150,43 @@ class Command {
 		if (this.fn) this.fn(sender, ...values);
 		return { ok: true };
 	}
+	// 生成用法字符串: $name <必选参数> [可选参数]
+	// 例: create <文件名> [X] [Y] [Z] [模式]
+	usage() {
+		const parts = this.params.map(([type, opt]) => {
+			const inner = type; // 参数名即类型说明（"文件名"/"X"/"模式"等）
+			return opt ? `[${inner}]` : `<${inner}>`;
+		});
+		return `$${this.name} ${parts.join(" ")}`.trim();
+	}
+	// 生成参数类型的中文说明（用于详细帮助）
+	static typeName(type) {
+		if (type === "int") return "整数";
+		if (type === "float") return "小数";
+		return "文本";
+	}
+	// 生成参数详情行列表（用于详细帮助）
+	paramDetail() {
+		return this.params.map(([type, opt, desc]) => {
+			const bracket = opt ? "可选" : "必选";
+			const typeInfo = Command.typeName(type);
+			let line = `§f<${type}> §7(${bracket}${typeInfo !== "文本" ? `, ${typeInfo}` : ""})`;
+			if (desc) line += ` §f- §7${desc}`; // 追加参数说明（如模式的可选值）
+			return line;
+		});
+	}
 }
 const cmd = (name, desc) => new Command(name, desc); // 快捷创建命令
+
+// 从 COMMAND_DEFS 帮助信息表创建命令外壳（描述 + 参数定义，不含处理函数）
+// 用法: defCmd("create").setFn(...)  — 帮助内容统一在文件头部维护
+function defCmd(name) {
+	const def = COMMAND_DEFS[name];
+	if (!def) throw new Error(`命令帮助表缺少定义: ${name}`);
+	const cm = cmd(name, def.desc);
+	for (const [pname, opt, pdesc] of def.params) cm.add(pname, opt, pdesc);
+	return cm;
+}
 
 // Client 类: 封装与游戏客户端的 WebSocket 通信
 // 发送基岩版命令协议包，并支持异步等待命令响应
@@ -506,52 +590,80 @@ class Litematic {
 		this.previewData = null; // 当前预览的建筑数据
 	}
 	// 注册全部游戏内命令（$ 前缀）
+	// 命令的描述与参数定义统一在文件头部 COMMAND_DEFS 表中维护
 	commands() {
 		const c = this.client;
 		return {
 			op: [
+				// $help [命令名] — 列出所有命令，或查看指定命令的用法
+				defCmd("help")
+					.setFn((sender, name) => {
+						const all = Object.values(this.commands()).flat();
+						if (name) {
+							// 查看单个命令的详细用法
+							const cm = all.find(x => x.name === name);
+							if (!cm) return c.tell(`§c没有找到命令: §f${name} §c(输入 $help 查看全部命令)`, sender);
+							const params = cm.paramDetail().length
+								? cm.paramDetail().map((p, i) => `  §7参数${i + 1}: §f${p}`).join("\n")
+								: "  §7无参数";
+							c.tell(
+								`§e=== 命令帮助: §b${cm.usage()} §e===\n` +
+								`§f说明: §7${cm.description}\n` +
+								`§f参数:\n${params}`, sender
+							);
+						} else {
+							// 列出全部命令（含用法）
+							const lines = all.map(cm =>
+								`§a${cm.usage()} §7- §f${cm.description}`
+							).join("\n");
+							c.tell(
+								`§e=== 可用命令 ===\n${lines}\n` +
+								`§7输入 §a$help <命令名> §7查看详细参数`, sender
+							);
+						}
+					}),
 				// $create <文件> [X] [Y] [Z] [trim|raw] — 导入建筑投影
-				cmd("create", "导入 Litematic 建筑投影").add("文件名").add("X", true).add("Y", true).add("Z", true).add("模式", true)
+				defCmd("create")
 					.setFn(async (sender, file, x, y, z, mode) => {
 						if (this.job) return c.tell("§c已有导入进程运行中，请等待完成或 $n 中断", sender);
 						await this.create(file, sender, x, y, z, mode);
 					}),
 				// $preview <文件> [X] [Y] [Z] [trim|raw] — 粒子+实体边框预览
-				cmd("preview", "预览建筑位置与轮廓").add("文件名").add("X", true).add("Y", true).add("Z", true).add("模式", true)
+				defCmd("preview")
 					.setFn(async (sender, file, x, y, z, mode) => {
 						await this.preview(file, sender, x, y, z, mode);
 					}),
 				// $unpreview — 清除预览
-				cmd("unpreview", "清除建筑预览").setFn((sender) => this.clearPreview(sender)),
+				defCmd("unpreview").setFn((sender) => this.clearPreview(sender)),
 				// $export <文件> [导出名] [trim|raw] — 导出 .mcstructure 结构文件
-				cmd("export", "导出为结构方块文件 .mcstructure").add("文件名").add("导出名", true).add("模式", true)
+				defCmd("export")
 					.setFn(async (sender, file, name, mode) => {
 						await this.exportStructure(file, sender, name, mode);
 					}),
 				// $list [页码] — 浏览建筑文件
-				cmd("list", "查看建筑文件列表").add("页码", true)
+				defCmd("list")
 					.setFn((sender, page) => this.listFiles(page, sender)),
 				// $search <关键词> [页码] — 搜索建筑文件
-				cmd("search", "搜索建筑文件").add("关键词").add("页码", true)
+				defCmd("search")
 					.setFn((sender, kw, page) => this.searchFiles(kw, page, sender)),
 				// $y — 确认待执行的导入
-				cmd("y", "确认导入操作").setFn((sender) => {
+				defCmd("y").setFn((sender) => {
 					if (!this.pending) return c.tell("§c没有待确认的导入任务", sender);
 					c.tell("§a已确认，开始导入…", sender);
 					this.run();
 				}),
 				// $n — 取消待确认任务或中断正在进行的导入
-				cmd("n", "取消/中断操作").setFn((sender) => {
+				defCmd("n").setFn((sender) => {
 					if (this.job) { this.job.cancelled = true; c.tell("§c正在中断导入…", sender); }
 					else if (this.pending) { this.pending = null; c.tell("§c已取消导入", sender); }
 					else c.tell("§c没有进行中的操作", sender);
 				}),
 				// $author — 作者信息
-				cmd("author", "查看作者信息").setFn((sender) => {
-					c.tell("StarAwA117", sender);
+				defCmd("author").setFn((sender) => {
+					c.tell("StarAwA117 & Hydrooxzgen", sender);
 				}),
 				// $status — 查看导入进度
-				cmd("status", "查看导入进度").setFn((sender) => {
+				defCmd("status").setFn((sender) => {
 					if (!this.job) return c.tell("§c没有进行中的导入任务", sender);
 					const j = this.job;
 					const el = ((Date.now() - j.startTime) / 1000).toFixed(1); // 已耗时（秒）
@@ -637,14 +749,15 @@ class Litematic {
 		c.tellAll(
 			`§e=== Litematic 导入预览 ===\n` +
 			`§f文件: §b${file}\n` +
-			`§f尺寸: §b${data.sx}§f × §b${data.sy}§f × §b${data.sz}§f = §e${data.totalCoords}§f 坐标\n` +
-			`§f非空气方块: §e${blockCount}§f → §e${cmdCount}§f 条指令\n` +
-			`§f底部空气: §e${data.trimmedAir}§f 层 §7(${raw ? "保留原始高度，建筑将从放置点上方 ${data.trimmedAir} 层开始" : "已裁剪，建筑底部对齐放置点"})\n` +
-			`§f区块: §e${chunks}§f 个 §7(${cX}×${cZ}) → §e${areas}§f 个区域\n` +
-			`§f范围: §7(${minX}, ${minY}, ${minZ}) → (${maxX}, ${maxY}, ${maxZ})\n` +
-			`§f预计耗时: §e${(areas + cmdCount) * 0.001 + 1}s\n` +
-			`§f确认请发送 §a$y§f，取消请发送 §c$n`
+			`§f尺寸: §b${data.sx}§f×§b${data.sy}§f×§b${data.sz}§f = §e${data.totalCoords}§f\n` +
+			`§f方块: §e${blockCount}§f → §e${cmdCount}§f 条指令\n` +
+			`§f底部空气: §e${data.trimmedAir}§f 层 §7(${raw ? `raw: 保留高度偏移 ${data.trimmedAir} 层` : "trim: 已裁剪对齐地面"})\n` +
+			`§f区块: §e${chunks}§f §7(${cX}×${cZ}) → §e${areas}§f 区域\n` +
+			`§f范围: §7(${minX},${minY},${minZ})→(${maxX},${maxY},${maxZ})\n` +
+			`§f预计: §e${((areas + cmdCount) * 0.001 + 1).toFixed(1)}s`
 		);
+		// 确认提示单独一条消息，避免与预览详情被截断拆分
+		c.tellAll(`§f确认请发送 §a$y§f §7| §f取消请发送 §c$n`);
 	}
 	async run() {
 		const { data, origin, file } = this.pending;
@@ -845,12 +958,72 @@ class Litematic {
 	}
 }
 
+// ==================== 终端控制台支持 ====================
+// 除了在游戏内聊天栏输入命令，也可以在运行本脚本的终端中直接输入 $ 命令。
+// 需要游戏连接的操作（查询坐标、放置方块）自动委托给当前活跃的 WebSocket 连接。
+
+let activeWs = null; // 当前活跃的游戏连接（终端命令的委托目标，取第一个连接）
+
+// 去掉 Minecraft 颜色代码（§x），用于终端纯文本显示
+function stripColor(msg) {
+	return String(msg).replace(/§[0-9a-fk-or]/g, "");
+}
+
+const rl = readline.createInterface({ input: process.stdin, output: process.stdout });
+rl.setPrompt("litematic> ");
+rl.prompt();
+
+// 输出到终端：清空当前输入行 → 打印（去颜色码）→ 恢复提示符
+function consoleOut(msg) {
+	process.stdout.write("\r\x1b[K");
+	console.log(stripColor(msg));
+	rl.prompt();
+}
+
+// 控制台客户端：对 Litematic 暴露与游戏连接相同的接口
+// sendCommand / runCommand / getPosition → 委托给活跃游戏连接
+// tell / tellAll → 输出到终端（tellAll 同时转发给游戏内玩家广播）
+const consoleClient = {
+	sendCommand: (...args) => activeWs ? activeWs.sendCommand(...args) : null,
+	runCommand: (...args) => activeWs ? activeWs.runCommand(...args) : Promise.resolve({ body: { statusCode: 1 } }),
+	getPosition: (...args) => activeWs ? activeWs.getPosition(...args) : Promise.resolve(null),
+	tell: (msg) => consoleOut(msg),
+	tellAll: (msg) => { consoleOut(msg); if (activeWs) activeWs.tellAll(msg); }
+};
+
+// 终端专用的 Litematic 实例（与游戏连接各自的实例相互独立，各自维护 pending/job 状态）
+const consoleMod = new Litematic(consoleClient);
+
+// 解析并执行一条命令（游戏内聊天与终端输入共用）
+// 返回 true 表示命令已匹配
+function dispatchCommand(mod, sender, text) {
+	const commands = mod.commands().op;
+	for (const c of commands) {
+		const r = c.execute(sender, text);
+		if (r) {
+			if (!r.ok) mod.client.tell(`Command §c${r.msg}`, sender);
+			return true;
+		}
+	}
+	return false;
+}
+
+// 终端输入监听：输入 $ 前缀命令直接执行
+rl.on("line", line => {
+	const text = line.trim();
+	if (!text) return; // 空输入直接忽略（提示符仍在）
+	if (text === "exit" || text === "quit") { rl.close(); process.exit(0); return; } // 退出脚本
+	if (!text.startsWith(PREFIX)) { consoleOut(`§7命令需以 ${PREFIX} 开头，输入 $help 查看帮助`); return; }
+	if (!dispatchCommand(consoleMod, "console", text.slice(1))) consoleOut(`§c未知的命令 ${text.split(" ")[0]}`);
+});
+
 const server = new WebSocketServer({ port: PORT });
 console.log(`[Litematic] listening on ws://localhost:${PORT}`);
+console.log(`[Litematic] 终端命令可用，输入 $help 查看帮助，exit 退出`);
 server.on("connection", ws => {
 	const cli = new Client(ws);
 	const mod = new Litematic(ws);
-	const commands = mod.commands().op;
+	if (!activeWs) activeWs = ws; // 记录第一个连接，供终端命令委托
 	cli.ws.send(JSON.stringify({ body: { eventName: "PlayerMessage" }, header: { requestId: crypto.randomUUID(), messagePurpose: "subscribe", version: 1, messageType: "commandRequest" } }));
 	ws.on("message", msg => {
 		let data;
@@ -859,17 +1032,13 @@ server.on("connection", ws => {
 		if (data?.header?.messagePurpose === "event" && data.header.eventName === "PlayerMessage") {
 			const sender = data.body?.sender, text = data.body?.message, type = data.body?.type;
 			if (!sender || !text || type !== "chat" || text.length >= 256 || !text.startsWith(PREFIX)) return;
-			for (const c of commands) {
-				const r = c.execute(sender, text.slice(1));
-				if (r) {
-					if (!r.ok) ws.tell(`Command §c${r.msg}`, sender);
-					return;
-				}
-			}
-			ws.tell(`§c未知的命令 ${text.split(" ")[0]}`, sender);
+			if (!dispatchCommand(mod, sender, text.slice(1))) ws.tell(`§c未知的命令 ${text.split(" ")[0]}`, sender);
 		}
 	});
-	ws.on("close", () => mod.destroy());
+	ws.on("close", () => {
+		mod.destroy();
+		if (activeWs === ws) activeWs = null; // 连接断开后清除委托目标
+	});
 	ws.on("error", e => console.error("[Litematic] error:", e.message));
 	ws.tellAll("§aLitematic §f已连接");
 	console.log("[Litematic] client connected");
