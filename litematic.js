@@ -732,7 +732,8 @@ class Litematic {
 			try {
 				const pos = await c.getPosition("@s");
 				if (!pos) return c.tell("§c无法获取你的坐标", sender);
-				origin = { x: Math.floor(pos.x), y: Math.floor(pos.y), z: Math.floor(pos.z) };
+				// 玩家脚底的 Y 是其脚下方块的上表面，减 1 使建筑底部对齐到脚下那层方块
+				origin = { x: Math.floor(pos.x), y: Math.floor(pos.y) - 1, z: Math.floor(pos.z) };
 			} catch { return c.tell("§c无法获取你的坐标", sender); }
 		}
 		if (origin.y < -64 || origin.y + data.sy - 1 > 320) return c.tell(`§cY 轴超出限制: §f${origin.y} ~ ${origin.y + data.sy - 1} §c(允许 -64 ~ 320)`, sender);
@@ -848,7 +849,8 @@ class Litematic {
 			try {
 				const pos = await c.getPosition("@s");
 				if (!pos) return c.tell("§c无法获取你的坐标", sender);
-				origin = { x: Math.floor(pos.x), y: Math.floor(pos.y), z: Math.floor(pos.z) };
+				// 玩家脚底的 Y 是其脚下方块的上表面，减 1 使建筑底部对齐到脚下那层方块
+				origin = { x: Math.floor(pos.x), y: Math.floor(pos.y) - 1, z: Math.floor(pos.z) };
 			} catch { return c.tell("§c无法获取你的坐标", sender); }
 		}
 		if (origin.y < -64 || origin.y + data.sy - 1 > 320) return c.tell(`§cY 轴超出限制: §f${origin.y} ~ ${origin.y + data.sy - 1} §c(允许 -64 ~ 320)`, sender);
