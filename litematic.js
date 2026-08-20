@@ -11,6 +11,8 @@
 //   $list/$search 浏览建筑文件
 //   $y/$n       确认 / 取消导入
 //   $status     查看导入进度
+//   $verify     检查游戏世界与投影一致性（默认，$create 返回任务 ID）；加 map 检查方块映射错误
+//   $fix        修复错误方块：重新放置被挖掉/替换的方块，或替换无法映射的方块
 //   $author     作者信息
 //   注：每条命令的详细用法、参数与 trim/raw 模式说明
 //       统一维护在下方 COMMAND_DEFS 表中，$help 输出自动读取。
@@ -68,7 +70,9 @@ const COMMAND_DEFS = {
 	y: { desc: "确认导入", params: [] },
 	n: { desc: "取消/中断导入", params: [] },
 	author: { desc: "查看作者信息", params: [] },
-	status: { desc: "查看导入进度", params: [] }
+	status: { desc: "查看导入进度", params: [] },
+	verify: { desc: "检查游戏世界与投影的方块差异（默认）；加 map 检查方块映射错误", params: [["ID", false, "任务 ID（$create 返回的数字）"], ["模式", true, "留空或 world=检查游戏世界与投影的方块差异（需游戏连接，逐块比对较慢，$n 可中断）；map=检查方块映射错误（无需连接）"]] },
+	fix: { desc: "修复错误方块：重新放置被挖掉/替换的方块，或替换无法映射的方块", params: [["ID", false, "任务 ID（$create 返回的数字）"], ["替代方块", true, "用于替换无法映射方块的方块，默认 stone"]] }
 };
 
 // 将长字符串按字节数分割成多个小段
@@ -358,10 +362,10 @@ function parseLitematic(filePath) {
 			const mapping = loadMappings();
 			const AIR = ["minecraft:air", "minecraft:cave_air", "minecraft:void_air"];
 			// 第三步: 将 palette 中每个 Java 方块状态映射为 Bedrock 方块
-			// proc[i] = { identifier, state } 或 null（空气/无法映射）
+			// proc[i] = { identifier, state }（可映射）| { unmapped: true, name }（无法映射）| null（空气）
 			const proc = palette.map(node => {
 				const st = node.value !== undefined ? node.value : node;
-				if (!st?.Name) return null;
+				if (!st?.Name) return { unmapped: true, name: "未知方块" };
 				const name = typeof st.Name === "string" ? st.Name : st.Name.value;
 				if (AIR.includes(name)) return null; // 空气方块 → null
 				// 提取方块属性
@@ -373,7 +377,7 @@ function parseLitematic(filePath) {
 				// 精确匹配（带属性）→ 兜底匹配（仅方块名）
 				const key = `${name}::${Object.keys(props).sort().map(k => `${k}=${props[k]}`).join(",")}`;
 				const info = mapping.get(key) || mapping.fallbackMap?.get(name);
-				return info ? { identifier: info.identifier, state: info.state } : null;
+				return info ? { identifier: info.identifier, state: info.state } : { unmapped: true, name };
 			});
 			// 第四步: 从位压缩数据解出每个格子的 palette 索引
 			// 每个索引占 bpi 位（最少 2 位），按位连续存储在大端 64 位字中
@@ -401,10 +405,18 @@ function parseLitematic(filePath) {
 			}
 			// 第五步: 遍历所有格子，收集非空气方块（x 变化最快）
 			const blocks = [];
+			const unmappedBlocks = []; // 无法映射到基岩版的方块（$verify 检查对象）
+			const unmappedSummary = new Map(); // java 方块名 -> 数量
 			let n = 0, minY = Infinity, maxY = -Infinity;
 			for (let y = 0; y < sy; y++) for (let z = 0; z < sz; z++) for (let x = 0; x < sx; x++) {
 				const i = indices[n++];
 				const c = i < proc.length ? proc[i] : null;
+				if (c?.unmapped) {
+					// 无法映射的方块：记录到错误清单，导入时跳过（视为空气）
+					unmappedBlocks.push({ x, y, z, name: c.name });
+					unmappedSummary.set(c.name, (unmappedSummary.get(c.name) || 0) + 1);
+					continue;
+				}
 				if (c) {
 					// 记录实际方块 Y 范围（用于空气层裁剪）
 					if (y < minY) minY = y;
@@ -425,7 +437,9 @@ function parseLitematic(filePath) {
 			return {
 				sx, sy, sz, totalCoords: total, blocks,
 				minY: minY === Infinity ? 0 : minY,
-				maxY: maxY === -Infinity ? sy - 1 : maxY
+				maxY: maxY === -Infinity ? sy - 1 : maxY,
+				unmappedBlocks,
+				unmappedSummary: Object.fromEntries(unmappedSummary)
 			};
 		});
 }
@@ -438,6 +452,7 @@ function trimAir(data) {
 	data.trimmedAir = off; // 记录裁剪量（用于预览信息显示）
 	if (off > 0) {
 		for (const b of data.blocks) b.y -= off; // 所有方块下移
+		for (const b of data.unmappedBlocks || []) b.y -= off; // 未映射方块同步下移（$fix 时保持坐标系一致）
 		data.sy = data.maxY - off + 1; // 重新计算有效高度
 		data.totalCoords = data.sx * data.sy * data.sz;
 	}
@@ -581,13 +596,17 @@ function mergeRects(blocks, sx, sz) {
 }
 
 // Litematic 主模块: 管理导入任务、预览、导出
+// 任务存档为静态共享：游戏连接与终端所有实例共用同一份，$create 返回的任务 ID 全局有效
 class Litematic {
+	static taskSeq = 0; // 任务 ID 自增计数器
+	static tasks = new Map(); // 任务存档: id -> { data, file, origin, raw, time }（供 $verify/$fix 使用）
 	constructor(client) {
 		this.client = client; // Client 实例（WebSocket 通信封装）
 		this.pending = null; // 待确认的导入任务（$create 后等待 $y）
 		this.job = null; // 正在执行的导入任务状态
 		this.previewTimer = null; // 预览粒子刷新定时器
 		this.previewData = null; // 当前预览的建筑数据
+		this.verifyJob = null; // 正在执行的世界检查状态（供 $n 中断）
 	}
 	// 注册全部游戏内命令（$ 前缀）
 	// 命令的描述与参数定义统一在文件头部 COMMAND_DEFS 表中维护
@@ -652,9 +671,10 @@ class Litematic {
 					c.tell("§a已确认，开始导入…", sender);
 					this.run();
 				}),
-				// $n — 取消待确认任务或中断正在进行的导入
+				// $n — 取消待确认任务或中断正在进行的导入/检查
 				defCmd("n").setFn((sender) => {
 					if (this.job) { this.job.cancelled = true; c.tell("§c正在中断导入…", sender); }
+					else if (this.verifyJob) { this.verifyJob.cancelled = true; c.tell("§c正在中断世界检查…", sender); }
 					else if (this.pending) { this.pending = null; c.tell("§c已取消导入", sender); }
 					else c.tell("§c没有进行中的操作", sender);
 				}),
@@ -674,6 +694,20 @@ class Litematic {
 						`§f进度: §e${j.phaseTotal > 0 ? (j.phasePlaced / j.phaseTotal * 100).toFixed(1) : "0.0"}%§f | §e${j.phasePlaced}§f / §7${j.phaseTotal}§f 命令 | 方块 §e${j.phaseBlocksPlaced}§f / §7${j.phaseBlockTotal}§f\n` +
 						`§f速度: §b${speed}§f 命令/s | §7${el}s | 预计 §f${speed > 0 ? ((j.phaseTotal - j.phasePlaced) / speed).toFixed(1) : "undefined"}s`
 					);
+				}),
+				// $verify <ID> [map|world] — 默认检查游戏世界与投影一致性；map 模式检查方块映射错误
+				defCmd("verify").setFn(async (sender, id, mode) => {
+					const tid = Number(id); // 命令参数为字符串，转数字匹配任务存档
+					if (!Litematic.tasks.has(tid)) return c.tell("§c没有找到任务 ID，请先 $create 获取任务 ID", sender);
+					if (mode === "map") return this.verify(tid, sender);
+					if (mode !== undefined && mode !== "world") return c.tell("§c模式参数无效：应为 map（检查方块映射）或留空（检查世界一致性）", sender);
+					return this.verifyWorld(tid, sender);
+				}),
+				// $fix <ID> [替代方块] — 修复：①重新放置 verify 发现的被挖掉/替换的方块 ②替换无法映射的方块
+				defCmd("fix").setFn((sender, id, fb) => {
+					const tid = Number(id); // 命令参数为字符串，转数字匹配任务存档
+					if (!Litematic.tasks.has(tid)) return c.tell("§c没有找到任务 ID，请先 $create 获取任务 ID", sender);
+					this.fix(tid, sender, fb);
 				})
 			]
 		};
@@ -738,6 +772,9 @@ class Litematic {
 		}
 		if (origin.y < -64 || origin.y + data.sy - 1 > 320) return c.tell(`§cY 轴超出限制: §f${origin.y} ~ ${origin.y + data.sy - 1} §c(允许 -64 ~ 320)`, sender);
 		this.pending = { file, origin, data, raw };
+		// 分配唯一任务 ID 并存档，供 $verify / $fix 使用（存档全局共享，游戏/终端均可用）
+		const taskId = ++Litematic.taskSeq;
+		Litematic.tasks.set(taskId, { data, file, origin, raw, time: Date.now() });
 		const minX = origin.x, minY = origin.y, minZ = origin.z;
 		const maxX = minX + data.sx - 1, maxY = minY + data.sy - 1, maxZ = minZ + data.sz - 1;
 		const blockCount = data.blocks.length;
@@ -747,8 +784,10 @@ class Litematic {
 		const chunks = cX * cZ;
 		let areas = 1;
 		if (chunks > 100) areas = cZ > 100 ? Math.ceil(cZ / 100) * cX : Math.ceil(cX / Math.floor(100 / cZ));
+		const unmappedCount = (data.unmappedBlocks || []).length;
 		c.tellAll(
 			`§e=== Litematic 导入预览 ===\n` +
+			`§f任务ID: §b${taskId} §7(用于 $verify / $fix)\n` +
 			`§f文件: §b${file}\n` +
 			`§f尺寸: §b${data.sx}§f×§b${data.sy}§f×§b${data.sz}§f = §e${data.totalCoords}§f\n` +
 			`§f方块: §e${blockCount}§f → §e${cmdCount}§f 条指令\n` +
@@ -757,6 +796,8 @@ class Litematic {
 			`§f范围: §7(${minX},${minY},${minZ})→(${maxX},${maxY},${maxZ})\n` +
 			`§f预计: §e${((areas + cmdCount) * 0.001 + 1).toFixed(1)}s`
 		);
+		// 无法映射方块提示单独一条消息，避免与预览详情被截断拆分
+		if (unmappedCount) c.tellAll(`§c⚠ 无法映射方块: §e${unmappedCount}§c 个 §7(可用 $verify ${taskId} map 检查，$fix ${taskId} 修复)`);
 		// 确认提示单独一条消息，避免与预览详情被截断拆分
 		c.tellAll(`§f确认请发送 §a$y§f §7| §f取消请发送 §c$n`);
 	}
@@ -829,6 +870,120 @@ class Litematic {
 			c.tellAll(`§aLitematic 导入完成 §7(§f${file}§7) §f共 §e${total}§f 个方块 §7${rects.length}§f 条指令 §7耗时 §f${el}s`);
 		}
 		this.job = null;
+	}
+	// $verify <ID>: 检查任务投影中方块映射错误（无法映射到基岩版的方块，导入时会被跳过）
+	verify(id, sender) {
+		const c = this.client;
+		const task = Litematic.tasks.get(id);
+		const data = task.data;
+		const unmapped = data.unmappedBlocks || [];
+		if (!unmapped.length) return c.tell(
+			`§a任务 #${id} §7(§f${task.file}§7) 方块映射检查通过，无 mod 方块错误\n` +
+			`§7提示: 要检查游戏世界里方块是否被挖掉/替换，请用 §a$verify ${id}`, sender
+		);
+		const lines = Object.entries(data.unmappedSummary || {})
+			.map(([name, cnt]) => `§f${name} §7× §e${cnt}`).join("\n");
+		c.tell(
+			`§e=== 方块检查报告 §7(任务 #${id}) §e===\n` +
+			`§f文件: §b${task.file}\n` +
+			`§c无法映射方块: §e${unmapped.length}§c 个 §7(导入时会被跳过)\n` +
+			`${lines}\n` +
+			`§7发送 §a$fix ${id} §7将用 stone 替换（可指定替代方块）`, sender
+		);
+	}
+	// $verify <ID> world: 检查游戏世界里投影区域与投影数据的差异
+	// 原理: 对投影的每个非空气方块执行 testforblock 逐块比对，不匹配（被挖掉/替换）即记录
+	// 注意: 只检测被挖掉/替换的方块，不检测玩家额外新增的方块（空气位置不检查）
+	async verifyWorld(id, sender) {
+		const c = this.client;
+		// 游戏连接的 client 是原始 ws（Client 将方法绑定在 ws 上），终端 client 通过 .ws getter 暴露活跃连接
+		const conn = c.ws || c;
+		if (!conn || conn.readyState !== WebSocket.OPEN) return c.tell("§c世界检查需要游戏连接（先 /connect 再使用）", sender);
+		const task = Litematic.tasks.get(id);
+		const data = task.data;
+		const { origin } = task;
+		const blocks = data.blocks; // 非空气方块（fix 后的替换方块也包含在内）
+		if (!blocks.length) return c.tell(`§a任务 #${id} 没有可检查的方块`, sender);
+		const t0 = Date.now();
+		const est = Math.ceil(blocks.length / 8); // 粗略预计秒数（并发 4，每命令约 50ms）
+		c.tell(`§7开始世界检查… §f${blocks.length}§7 个方块 §7(预计 §e${est}s§7 左右，$n 可中断)`, sender);
+		const CONC = 4; // 并发命令数（避免服务器限流丢命令）
+		const mismatches = []; // 差异列表: {x,y,z,expect}
+		let checked = 0;
+		const delay = ms => new Promise(r => setTimeout(r, ms));
+		this.verifyJob = { cancelled: false };
+		try {
+			const checkOne = async b => {
+				const ax = origin.x + b.x, ay = origin.y + b.y, az = origin.z + b.z;
+				try {
+					const d = await c.runCommand(`testforblock ${ax} ${ay} ${az} ${b.identifier}`);
+					if (d?.body?.statusCode !== 0) mismatches.push({ x: ax, y: ay, z: az, expect: b.identifier });
+				} catch { mismatches.push({ x: ax, y: ay, z: az, expect: b.identifier }); }
+				checked++;
+			};
+			// 分批并发执行，每批 CONC 个；每 500 块报告一次进度
+			for (let i = 0; i < blocks.length && !this.verifyJob.cancelled; i += CONC) {
+				await Promise.all(blocks.slice(i, i + CONC).map(checkOne));
+				if (checked >= 500 && checked % 500 === 0) {
+					c.tellAll(`§7世界检查进度: §e${checked}§7/${blocks.length} §7| 不匹配: §c${mismatches.length}§7 个`);
+				}
+				await delay(1);
+			}
+		} finally { this.verifyJob = null; }
+		if (checked === 0) return c.tell("§c世界检查已中断", sender);
+		const el = ((Date.now() - t0) / 1000).toFixed(1);
+		// 差异列表存档到任务，供 $fix 修复（重新放置期望方块）
+		task.mismatches = mismatches;
+		if (!mismatches.length) {
+			return c.tell(`§a世界检查完成 §7(任务 #${id}) §f已逐块 testforblock 比对 §e${checked}§7 个方块，全部与投影一致 §7耗时 §f${el}s`, sender);
+		}
+		const list = mismatches.slice(0, 20).map(m => `§7(${m.x},${m.y},${m.z}) §f期望 §e${m.expect.replace(/^minecraft:/, "")}`).join("\n");
+		c.tell(
+			`§e=== 世界检查报告 §7(任务 #${id}) §e===\n` +
+			`§f文件: §b${task.file}\n` +
+			`§f检查: §e${checked}§f 个方块 §7| 不匹配: §c${mismatches.length}§f 个 §7耗时 ${el}s\n` +
+			`${list}${mismatches.length > 20 ? `\n§7…共 ${mismatches.length} 处差异` : ""}\n` +
+			`§7差异可能是方块被挖掉或替换（本检查不检测额外新增的方块）\n` +
+			`§7发送 §a$fix ${id} §7可重新放置这些方块，恢复与投影一致`, sender
+		);
+	}
+	// $fix <ID> [替代方块]: ① 重新放置 verify 世界检查发现的被挖掉/替换的方块（恢复投影一致）
+	//                        ② 将无法映射的方块替换为指定方块（默认 stone），修复映射错误
+	fix(id, sender, fb) {
+		const c = this.client;
+		const task = Litematic.tasks.get(id);
+		const data = task.data;
+		const fixed = [];
+		// ① 修复世界检查发现的差异（需游戏连接执行 setblock 放置）
+		const mismatches = task.mismatches || [];
+		if (mismatches.length) {
+			const conn = c.ws || c;
+			if (!conn || conn.readyState !== WebSocket.OPEN) return c.tell("§c修复世界差异需要游戏连接（先 /connect 再使用）", sender);
+			for (const m of mismatches) {
+				const idn = m.expect.replace(/^minecraft:/, ""); // 命令用名（去掉命名空间）
+				c.sendCommand(`/setblock ${m.x} ${m.y} ${m.z} ${idn}`);
+				fixed.push(`§7(${m.x},${m.y},${m.z}) §f→ §e${idn}`);
+			}
+			task.mismatches = []; // 清空差异存档，避免重复修复
+		}
+		// ② 修复无法映射的方块（更新任务数据，供 $y 导入）
+		const unmapped = data.unmappedBlocks || [];
+		if (unmapped.length) {
+			const bid = fb || "minecraft:stone"; // 替代方块完整标识符
+			const idn = bid.replace(/^minecraft:/, ""); // 命令用名（去掉命名空间）
+			for (const u of unmapped) {
+				data.blocks.push({ x: u.x, y: u.y, z: u.z, identifier: bid, state: {}, cmd: idn });
+			}
+			data.unmappedBlocks = [];
+			data.unmappedSummary = {};
+		}
+		const n1 = mismatches.length, n2 = unmapped.length;
+		if (!n1 && !n2) return c.tell(`§a任务 #${id} 没有需要修复的方块`, sender);
+		const lines = [];
+		if (n1) lines.push(`§a已重新放置 §e${n1}§a 个方块 §7(恢复与投影一致)`);
+		if (n2) lines.push(`§a已将 §e${n2}§a 个无法映射方块替换为 §b${fb || "minecraft:stone"}§7，任务存档已更新，直接发送 §a$y §7即可用修复后的数据导入`);
+		if (fixed.length) lines.push(fixed.slice(0, 20).join("\n"));
+		c.tell(`§a已修复 §7(任务 #${id})\n${lines.join("\n")}`, sender);
 	}
 	// ---- 预览 ----
 	async preview(file, sender, x, y, z, mode) {
@@ -986,6 +1141,7 @@ function consoleOut(msg) {
 // sendCommand / runCommand / getPosition → 委托给活跃游戏连接
 // tell / tellAll → 输出到终端（tellAll 同时转发给游戏内玩家广播）
 const consoleClient = {
+	get ws() { return activeWs; }, // 委托当前活跃连接（供世界检查等判断连接状态）
 	sendCommand: (...args) => activeWs ? activeWs.sendCommand(...args) : null,
 	runCommand: (...args) => activeWs ? activeWs.runCommand(...args) : Promise.resolve({ body: { statusCode: 1 } }),
 	getPosition: (...args) => activeWs ? activeWs.getPosition(...args) : Promise.resolve(null),
