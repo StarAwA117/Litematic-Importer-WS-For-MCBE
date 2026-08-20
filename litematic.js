@@ -4,18 +4,25 @@
 // Litematic Importer WS For MCBE
 // 通过 WebSocket 将 Litematica 建筑投影导入 Minecraft 基岩版
 //
-//   命令：
+//   命令（游戏内聊天栏或运行脚本的终端中均可使用）：
+//   $help       查看所有命令
 //   $create     导入建筑投影（支持裁剪底部空气层）
 //   $preview    粒子边框 + 实体标记预览建筑位置
+//   $unpreview  清除建筑预览
 //   $export     导出为 .mcstructure 结构文件
 //   $list/$search 浏览建筑文件
 //   $y/$n       确认 / 取消导入
 //   $status     查看导入进度
+//   $author     作者信息
+//
+//   终端操作：提示符 litematic>，输入 exit 退出；
+//   需要游戏连接的操作自动委托给当前活跃的 WebSocket 连接。
 
 import fs from "fs";
 import path from "path";
 import zlib from "zlib";
 import crypto from "crypto";
+import readline from "readline"; // 终端交互（在终端中直接执行命令）
 import WebSocket, { WebSocketServer } from "ws";
 
 const LITEMATIC_DIR = "./litematic"; // litematic 文件存放目录
@@ -510,6 +517,13 @@ class Litematic {
 		const c = this.client;
 		return {
 			op: [
+				// $help — 列出所有可用命令
+				cmd("help", "查看所有可用命令").setFn((sender) => {
+					const lines = Object.values(this.commands()).flat()
+						.map(cm => `§a$${cm.name} §7- §f${cm.description}`)
+						.join("\n");
+					c.tell(`§e=== 可用命令 ===\n${lines}`, sender);
+				}),
 				// $create <文件> [X] [Y] [Z] [trim|raw] — 导入建筑投影
 				cmd("create", "导入 Litematic 建筑投影").add("文件名").add("X", true).add("Y", true).add("Z", true).add("模式", true)
 					.setFn(async (sender, file, x, y, z, mode) => {
@@ -845,12 +859,72 @@ class Litematic {
 	}
 }
 
+// ==================== 终端控制台支持 ====================
+// 除了在游戏内聊天栏输入命令，也可以在运行本脚本的终端中直接输入 $ 命令。
+// 需要游戏连接的操作（查询坐标、放置方块）自动委托给当前活跃的 WebSocket 连接。
+
+let activeWs = null; // 当前活跃的游戏连接（终端命令的委托目标，取第一个连接）
+
+// 去掉 Minecraft 颜色代码（§x），用于终端纯文本显示
+function stripColor(msg) {
+	return String(msg).replace(/§[0-9a-fk-or]/g, "");
+}
+
+const rl = readline.createInterface({ input: process.stdin, output: process.stdout });
+rl.setPrompt("litematic> ");
+rl.prompt();
+
+// 输出到终端：清空当前输入行 → 打印（去颜色码）→ 恢复提示符
+function consoleOut(msg) {
+	process.stdout.write("\r\x1b[K");
+	console.log(stripColor(msg));
+	rl.prompt();
+}
+
+// 控制台客户端：对 Litematic 暴露与游戏连接相同的接口
+// sendCommand / runCommand / getPosition → 委托给活跃游戏连接
+// tell / tellAll → 输出到终端（tellAll 同时转发给游戏内玩家广播）
+const consoleClient = {
+	sendCommand: (...args) => activeWs ? activeWs.sendCommand(...args) : null,
+	runCommand: (...args) => activeWs ? activeWs.runCommand(...args) : Promise.resolve({ body: { statusCode: 1 } }),
+	getPosition: (...args) => activeWs ? activeWs.getPosition(...args) : Promise.resolve(null),
+	tell: (msg) => consoleOut(msg),
+	tellAll: (msg) => { consoleOut(msg); if (activeWs) activeWs.tellAll(msg); }
+};
+
+// 终端专用的 Litematic 实例（与游戏连接各自的实例相互独立，各自维护 pending/job 状态）
+const consoleMod = new Litematic(consoleClient);
+
+// 解析并执行一条命令（游戏内聊天与终端输入共用）
+// 返回 true 表示命令已匹配
+function dispatchCommand(mod, sender, text) {
+	const commands = mod.commands().op;
+	for (const c of commands) {
+		const r = c.execute(sender, text);
+		if (r) {
+			if (!r.ok) mod.client.tell(`Command §c${r.msg}`, sender);
+			return true;
+		}
+	}
+	return false;
+}
+
+// 终端输入监听：输入 $ 前缀命令直接执行
+rl.on("line", line => {
+	const text = line.trim();
+	if (!text) return; // 空输入直接忽略（提示符仍在）
+	if (text === "exit" || text === "quit") { rl.close(); process.exit(0); return; } // 退出脚本
+	if (!text.startsWith(PREFIX)) { consoleOut(`§7命令需以 ${PREFIX} 开头，输入 $help 查看帮助`); return; }
+	if (!dispatchCommand(consoleMod, "console", text.slice(1))) consoleOut(`§c未知的命令 ${text.split(" ")[0]}`);
+});
+
 const server = new WebSocketServer({ port: PORT });
 console.log(`[Litematic] listening on ws://localhost:${PORT}`);
+console.log(`[Litematic] 终端命令可用，输入 $help 查看帮助，exit 退出`);
 server.on("connection", ws => {
 	const cli = new Client(ws);
 	const mod = new Litematic(ws);
-	const commands = mod.commands().op;
+	if (!activeWs) activeWs = ws; // 记录第一个连接，供终端命令委托
 	cli.ws.send(JSON.stringify({ body: { eventName: "PlayerMessage" }, header: { requestId: crypto.randomUUID(), messagePurpose: "subscribe", version: 1, messageType: "commandRequest" } }));
 	ws.on("message", msg => {
 		let data;
@@ -859,17 +933,13 @@ server.on("connection", ws => {
 		if (data?.header?.messagePurpose === "event" && data.header.eventName === "PlayerMessage") {
 			const sender = data.body?.sender, text = data.body?.message, type = data.body?.type;
 			if (!sender || !text || type !== "chat" || text.length >= 256 || !text.startsWith(PREFIX)) return;
-			for (const c of commands) {
-				const r = c.execute(sender, text.slice(1));
-				if (r) {
-					if (!r.ok) ws.tell(`Command §c${r.msg}`, sender);
-					return;
-				}
-			}
-			ws.tell(`§c未知的命令 ${text.split(" ")[0]}`, sender);
+			if (!dispatchCommand(mod, sender, text.slice(1))) ws.tell(`§c未知的命令 ${text.split(" ")[0]}`, sender);
 		}
 	});
-	ws.on("close", () => mod.destroy());
+	ws.on("close", () => {
+		mod.destroy();
+		if (activeWs === ws) activeWs = null; // 连接断开后清除委托目标
+	});
 	ws.on("error", e => console.error("[Litematic] error:", e.message));
 	ws.tellAll("§aLitematic §f已连接");
 	console.log("[Litematic] client connected");
