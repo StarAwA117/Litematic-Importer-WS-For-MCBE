@@ -215,11 +215,20 @@ class Client {
 		}));
 	}
 	// 发送游戏命令并等待响应（用于需要返回值的命令，如 querytarget）
-	runCommand(cmd) {
+	// timeout: 毫秒。服务器限流时会静默丢弃命令（无响应），>0 时超时 reject，避免永久挂起
+	runCommand(cmd, timeout = 0) {
 		return new Promise((resolve, reject) => {
 			if (typeof cmd !== "string" || !this.ws || this.ws.readyState !== OPEN || Buffer.byteLength(cmd, "utf8") > 461) return reject(new Error("无效的命令"));
 			const id = crypto.randomUUID();
-			this.back.set(id, resolve); // 登记回调，onMessage 收到响应时触发
+			let timer = null;
+			if (timeout > 0) timer = setTimeout(() => {
+				this.back.delete(id); // 清理登记，迟到的响应直接忽略
+				reject(new Error("命令超时（可能被服务器限流丢弃）"));
+			}, timeout);
+			this.back.set(id, data => {
+				if (timer) clearTimeout(timer);
+				resolve(data);
+			}); // 登记回调，onMessage 收到响应时触发
 			this.ws.send(JSON.stringify({
 				body: { origin: { type: "player" }, commandLine: cmd, version: 17104896 },
 				header: { requestId: id, messagePurpose: "commandRequest", version: 1, messageType: "commandRequest" }
@@ -915,10 +924,20 @@ class Litematic {
 		try {
 			const checkOne = async b => {
 				const ax = origin.x + b.x, ay = origin.y + b.y, az = origin.z + b.z;
-				try {
-					const d = await c.runCommand(`testforblock ${ax} ${ay} ${az} ${b.identifier}`);
-					if (d?.body?.statusCode !== 0) mismatches.push({ x: ax, y: ay, z: az, expect: b.identifier });
-				} catch { mismatches.push({ x: ax, y: ay, z: az, expect: b.identifier }); }
+				// b.cmd 含方块状态（如 stair ["upside_down_bit"=true]），testforblock 带状态才能区分正/倒楼梯、朝向等
+				const cmd = `testforblock ${ax} ${ay} ${az} ${b.cmd || b.identifier}`;
+				let matched = false;
+				// testforblock 命令可能被服务器限流丢弃（无响应），超时重试最多 3 次，避免误报差异
+				for (let attempt = 0; attempt < 3; attempt++) {
+					try {
+						const d = await c.runCommand(cmd, 3000);
+						if (d?.body?.statusCode === 0) matched = true;
+						break; // 服务器有响应 → 以结果为准（不匹配即真实差异）
+					} catch {
+						if (attempt < 2) await delay(300); // 超时/丢命令 → 稍等后重试
+					}
+				}
+				if (!matched) mismatches.push({ x: ax, y: ay, z: az, expect: b.identifier, cmd: b.cmd || b.identifier });
 				checked++;
 			};
 			// 分批并发执行，每批 CONC 个；每 500 块报告一次进度
@@ -937,7 +956,11 @@ class Litematic {
 		if (!mismatches.length) {
 			return c.tell(`§a世界检查完成 §7(任务 #${id}) §f已逐块 testforblock 比对 §e${checked}§7 个方块，全部与投影一致 §7耗时 §f${el}s`, sender);
 		}
-		const list = mismatches.slice(0, 20).map(m => `§7(${m.x},${m.y},${m.z}) §f期望 §e${m.expect.replace(/^minecraft:/, "")}`).join("\n");
+		// 差异行: 坐标 + 期望方块名 + 状态（如 ["upside_down_bit"=true]），帮助判断正/倒、朝向
+		const list = mismatches.slice(0, 20).map(m => {
+			const sp = m.cmd && m.cmd.includes("[") ? m.cmd.slice(m.cmd.indexOf("[")) : "";
+			return `§7(${m.x},${m.y},${m.z}) §f期望 §e${m.expect.replace(/^minecraft:/, "")}§f${sp}`;
+		}).join("\n");
 		c.tell(
 			`§e=== 世界检查报告 §7(任务 #${id}) §e===\n` +
 			`§f文件: §b${task.file}\n` +
@@ -949,26 +972,44 @@ class Litematic {
 	}
 	// $fix <ID> [替代方块]: ① 重新放置 verify 世界检查发现的被挖掉/替换的方块（恢复投影一致）
 	//                        ② 将无法映射的方块替换为指定方块（默认 stone），修复映射错误
-	fix(id, sender, fb) {
+	// 说明: setblock 命令可能被服务器限流丢弃（无响应），逐个等待响应并自动重试；重试仍失败的差异保留，可再次 $fix
+	async fix(id, sender, fb) {
 		const c = this.client;
 		const task = Litematic.tasks.get(id);
 		const data = task.data;
-		const fixed = [];
+		const delay = ms => new Promise(r => setTimeout(r, ms));
+		let n1 = 0, n2 = 0;
+		const fixed = []; // 放置成功清单
+		const failed = []; // 重试仍失败（命令被限流）的差异
 		// ① 修复世界检查发现的差异（需游戏连接执行 setblock 放置）
 		const mismatches = task.mismatches || [];
 		if (mismatches.length) {
+			n1 = mismatches.length;
 			const conn = c.ws || c;
 			if (!conn || conn.readyState !== WebSocket.OPEN) return c.tell("§c修复世界差异需要游戏连接（先 /connect 再使用）", sender);
-			for (const m of mismatches) {
-				const idn = m.expect.replace(/^minecraft:/, ""); // 命令用名（去掉命名空间）
-				c.sendCommand(`/setblock ${m.x} ${m.y} ${m.z} ${idn}`);
-				fixed.push(`§7(${m.x},${m.y},${m.z}) §f→ §e${idn}`);
+			const CONC = 4; // 并发放置（避免一次发太多命令被限流）
+			const placeOne = async m => {
+				const idn = m.expect.replace(/^minecraft:/, "");
+				// m.cmd 含方块状态（如 stair ["upside_down_bit"=true]），setblock 带状态才能恢复正/倒楼梯、朝向
+				const cmd = `/setblock ${m.x} ${m.y} ${m.z} ${m.cmd || idn}`;
+				for (let attempt = 0; attempt < 3; attempt++) {
+					try {
+						const d = await c.runCommand(cmd, 3000);
+						if (d?.body?.statusCode === 0) { fixed.push(`§7(${m.x},${m.y},${m.z}) §f→ §e${idn}`); return; }
+					} catch {}
+					await delay(300); // 失败或超时 → 稍等后重试
+				}
+				failed.push(m); // 重试仍失败 → 保留差异，供再次 $fix
+			};
+			for (let i = 0; i < mismatches.length; i += CONC) {
+				await Promise.all(mismatches.slice(i, i + CONC).map(placeOne));
 			}
-			task.mismatches = []; // 清空差异存档，避免重复修复
+			task.mismatches = failed; // 未成功的差异保留，再次 $fix 继续修复
 		}
 		// ② 修复无法映射的方块（更新任务数据，供 $y 导入）
 		const unmapped = data.unmappedBlocks || [];
 		if (unmapped.length) {
+			n2 = unmapped.length;
 			const bid = fb || "minecraft:stone"; // 替代方块完整标识符
 			const idn = bid.replace(/^minecraft:/, ""); // 命令用名（去掉命名空间）
 			for (const u of unmapped) {
@@ -977,10 +1018,12 @@ class Litematic {
 			data.unmappedBlocks = [];
 			data.unmappedSummary = {};
 		}
-		const n1 = mismatches.length, n2 = unmapped.length;
 		if (!n1 && !n2) return c.tell(`§a任务 #${id} 没有需要修复的方块`, sender);
 		const lines = [];
-		if (n1) lines.push(`§a已重新放置 §e${n1}§a 个方块 §7(恢复与投影一致)`);
+		if (n1) {
+			lines.push(`§a已重新放置 §e${fixed.length}§a / §e${n1}§a 个方块 §7(恢复与投影一致)`);
+			if (failed.length) lines.push(`§c未成功 §e${failed.length}§c 个 §7(命令被服务器限流，可再次 §a$verify ${id}§7 检查并 §a$fix ${id}§7 重试)`);
+		}
 		if (n2) lines.push(`§a已将 §e${n2}§a 个无法映射方块替换为 §b${fb || "minecraft:stone"}§7，任务存档已更新，直接发送 §a$y §7即可用修复后的数据导入`);
 		if (fixed.length) lines.push(fixed.slice(0, 20).join("\n"));
 		c.tell(`§a已修复 §7(任务 #${id})\n${lines.join("\n")}`, sender);
