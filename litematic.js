@@ -9,8 +9,9 @@
 //   $unpreview  清除建筑预览
 //   $export     导出为 .mcstructure 结构文件
 //   $list/$search 浏览建筑文件
+//   $id        查看所有任务 ID（$create 创建的项目，供 $verify/$fix 使用）
 //   $y/$n       确认 / 取消导入
-//   $status     查看导入进度
+//   $status     查看所有进行中任务进度（导入/世界检查/修复）
 //   $verify     检查游戏世界与投影一致性（默认，$create 返回任务 ID）；加 map 检查方块映射错误
 //   $fix        修复错误方块：重新放置被挖掉/替换的方块，或替换无法映射的方块
 //   $author     作者信息
@@ -66,11 +67,12 @@ const COMMAND_DEFS = {
 		]
 	},
 	list: { desc: "查看建筑文件列表", params: [["页码", true, "页码（每页 5 个，默认第 1 页）"]] },
+	id: { desc: "查看所有任务 ID（$create 创建的项目，供 $verify/$fix 使用）", params: [] },
 	search: { desc: "搜索建筑文件", params: [["关键词", false, "搜索关键词（不区分大小写）"], ["页码", true, "页码（默认第 1 页）"]] },
 	y: { desc: "确认导入", params: [] },
 	n: { desc: "取消/中断导入", params: [] },
 	author: { desc: "查看作者信息", params: [] },
-	status: { desc: "查看导入进度", params: [] },
+	status: { desc: "查看所有进行中任务进度（导入/世界检查/修复）", params: [] },
 	verify: { desc: "检查游戏世界与投影的方块差异（默认）；加 map 检查方块映射错误", params: [["ID", false, "任务 ID（$create 返回的数字）"], ["模式", true, "留空或 world=检查游戏世界与投影的方块差异（需游戏连接，逐块比对较慢，$n 可中断）；map=检查方块映射错误（无需连接）"]] },
 	fix: { desc: "修复错误方块：重新放置被挖掉/替换的方块，或替换无法映射的方块", params: [["ID", false, "任务 ID（$create 返回的数字）"], ["替代方块", true, "用于替换无法映射方块的方块，默认 stone"]] }
 };
@@ -615,7 +617,8 @@ class Litematic {
 		this.job = null; // 正在执行的导入任务状态
 		this.previewTimer = null; // 预览粒子刷新定时器
 		this.previewData = null; // 当前预览的建筑数据
-		this.verifyJob = null; // 正在执行的世界检查状态（供 $n 中断）
+		this.verifyJob = null; // 正在执行的世界检查状态（供 $n 中断、$status 查看进度）
+		this.fixJob = null; // 正在执行的修复任务状态（供 $n 中断、$status 查看进度）
 	}
 	// 注册全部游戏内命令（$ 前缀）
 	// 命令的描述与参数定义统一在文件头部 COMMAND_DEFS 表中维护
@@ -671,6 +674,8 @@ class Litematic {
 				// $list [页码] — 浏览建筑文件
 				defCmd("list")
 					.setFn((sender, page) => this.listFiles(page, sender)),
+				// $id — 查看所有任务 ID（$create 创建的项目，供 $verify/$fix 使用）
+				defCmd("id").setFn((sender) => this.listTasks(sender)),
 				// $search <关键词> [页码] — 搜索建筑文件
 				defCmd("search")
 					.setFn((sender, kw, page) => this.searchFiles(kw, page, sender)),
@@ -684,6 +689,7 @@ class Litematic {
 				defCmd("n").setFn((sender) => {
 					if (this.job) { this.job.cancelled = true; c.tell("§c正在中断导入…", sender); }
 					else if (this.verifyJob) { this.verifyJob.cancelled = true; c.tell("§c正在中断世界检查…", sender); }
+					else if (this.fixJob) { this.fixJob.cancelled = true; c.tell("§c正在中断修复…", sender); }
 					else if (this.pending) { this.pending = null; c.tell("§c已取消导入", sender); }
 					else c.tell("§c没有进行中的操作", sender);
 				}),
@@ -691,18 +697,42 @@ class Litematic {
 				defCmd("author").setFn((sender) => {
 					c.tell("StarAwA117 & Hydrooxzgen", sender);
 				}),
-				// $status — 查看导入进度
+				// $status — 查看所有进行中任务进度（导入 / 世界检查 / 修复）
 				defCmd("status").setFn((sender) => {
-					if (!this.job) return c.tell("§c没有进行中的导入任务", sender);
-					const j = this.job;
-					const el = ((Date.now() - j.startTime) / 1000).toFixed(1); // 已耗时（秒）
-					const speed = j.phasePlaced > 0 ? Math.round(j.phasePlaced / parseFloat(el)) : 0; // 命令/秒
-					c.tellAll(
-						`§f正在导入 §b${j.fileName} §7| 总进度 §e${j.total > 0 ? (j.phasePlaced / j.total * 100).toFixed(1) : "0.0"}% §7| 预计 §f${speed > 0 ? ((j.total - j.phasePlaced) / speed).toFixed(1) : "undefined"}s\n` +
-						`§f阶段: §e${j.phase} §7(${j.areaIndex}/${j.areaTotal} 区域)\n` +
-						`§f进度: §e${j.phaseTotal > 0 ? (j.phasePlaced / j.phaseTotal * 100).toFixed(1) : "0.0"}%§f | §e${j.phasePlaced}§f / §7${j.phaseTotal}§f 命令 | 方块 §e${j.phaseBlocksPlaced}§f / §7${j.phaseBlockTotal}§f\n` +
-						`§f速度: §b${speed}§f 命令/s | §7${el}s | 预计 §f${speed > 0 ? ((j.phaseTotal - j.phasePlaced) / speed).toFixed(1) : "undefined"}s`
-					);
+					const lines = [];
+					// ① 导入进度
+					if (this.job) {
+						const j = this.job;
+						const el = ((Date.now() - j.startTime) / 1000).toFixed(1); // 已耗时（秒）
+						const speed = j.phasePlaced > 0 ? Math.round(j.phasePlaced / parseFloat(el)) : 0; // 命令/秒
+						lines.push(
+							`§e=== 导入 §7(${j.fileName}) §e===\n` +
+							`§f总进度 §e${j.total > 0 ? (j.phasePlaced / j.total * 100).toFixed(1) : "0.0"}% §7| 预计 §f${speed > 0 ? ((j.total - j.phasePlaced) / speed).toFixed(1) : "?"}s\n` +
+							`§f阶段: §e${j.phase} §7(${j.areaIndex}/${j.areaTotal} 区域)\n` +
+							`§f进度: §e${j.phaseTotal > 0 ? (j.phasePlaced / j.phaseTotal * 100).toFixed(1) : "0.0"}%§f | §e${j.phasePlaced}§f / §7${j.phaseTotal}§f 命令 | 方块 §e${j.phaseBlocksPlaced}§f / §7${j.phaseBlockTotal}§f\n` +
+							`§f速度: §b${speed}§f 命令/s §7| ${el}s`
+						);
+					}
+					// ② 世界检查进度
+					if (this.verifyJob) {
+						const v = this.verifyJob;
+						const el = ((Date.now() - v.startTime) / 1000).toFixed(1);
+						lines.push(
+							`§e=== 世界检查 §7(任务 #${v.taskId}: ${v.fileName}) §e===\n` +
+							`§f进度: §e${v.total > 0 ? (v.checked / v.total * 100).toFixed(1) : "0.0"}%§f | §e${v.checked}§f / §7${v.total}§f 方块 §7| 不匹配: §c${v.mismatches}§7 个 §7| ${el}s`
+						);
+					}
+					// ③ 修复进度
+					if (this.fixJob) {
+						const f = this.fixJob;
+						const el = ((Date.now() - f.startTime) / 1000).toFixed(1);
+						lines.push(
+							`§e=== 修复 §7(任务 #${f.taskId}: ${f.fileName}) §e===\n` +
+							`§f进度: §e${f.done}§f / §7${f.total}§f 方块 §7| ${el}s`
+						);
+					}
+					if (!lines.length) return c.tell("§c当前没有进行中的任务", sender);
+					c.tellAll(lines.join("\n\n"));
 				}),
 				// $verify <ID> [map|world] — 默认检查游戏世界与投影一致性；map 模式检查方块映射错误
 				defCmd("verify").setFn(async (sender, id, mode) => {
@@ -716,6 +746,7 @@ class Litematic {
 				defCmd("fix").setFn((sender, id, fb) => {
 					const tid = Number(id); // 命令参数为字符串，转数字匹配任务存档
 					if (!Litematic.tasks.has(tid)) return c.tell("§c没有找到任务 ID，请先 $create 获取任务 ID", sender);
+					if (this.fixJob) return c.tell("§c已有修复任务进行中，请等待完成或 $n 中断", sender);
 					this.fix(tid, sender, fb);
 				})
 			]
@@ -741,6 +772,25 @@ class Litematic {
 		this.page = page ?? 1;
 		const files = fs.existsSync(LITEMATIC_DIR) ? fs.readdirSync(LITEMATIC_DIR).filter(f => f.endsWith(".litematic")).sort() : [];
 		this.pageList(sender, files, "§e=== §f建筑文件列表 §e===");
+	}
+	// $id — 列出所有任务（项目）的 ID，新任务在前；带方块数、创建时间与待处理标记
+	listTasks(sender) {
+		const c = this.client;
+		const tasks = [...Litematic.tasks.entries()].sort((a, b) => b[0] - a[0]); // 按 ID 倒序，新任务在前
+		if (!tasks.length) return c.tell("§c当前没有任务，先 $create 创建", sender);
+		const now = Date.now();
+		const lines = tasks.map(([id, t]) => {
+			const blocks = t.data?.blocks?.length ?? 0;
+			// 相对时间: 刚刚 / N分钟前 / N小时前 / N天前
+			const age = now - t.time;
+			const ago = age < 60000 ? "刚刚" : age < 3600000 ? `${Math.floor(age / 60000)}分钟前` : age < 86400000 ? `${Math.floor(age / 3600000)}小时前` : `${Math.floor(age / 86400000)}天前`;
+			// 待处理标记: verify 发现的差异 / 无法映射方块
+			const tags = [];
+			if ((t.mismatches || []).length) tags.push(`§c差异 §e${t.mismatches.length}§c 个`);
+			if ((t.data?.unmappedBlocks || []).length) tags.push(`§e未映射 ${t.data.unmappedBlocks.length} 个`);
+			return `§b${String(id).padStart(3, " ")}. §f${t.file} §7| §f${blocks}§7 方块 §7| §7${ago}${tags.length ? " §7| " + tags.join(" ") : ""}`;
+		}).join("\n");
+		c.tell(`§e=== 任务列表 §7(${tasks.length} 个) §e===\n${lines}\n§7使用 §a$verify <ID>§7 检查世界差异 / §a$fix <ID>§7 修复`, sender);
 	}
 	searchFiles(keyword, page, sender) {
 		this.page = page ?? 1;
@@ -920,7 +970,7 @@ class Litematic {
 		const mismatches = []; // 差异列表: {x,y,z,expect}
 		let checked = 0;
 		const delay = ms => new Promise(r => setTimeout(r, ms));
-		this.verifyJob = { cancelled: false };
+		this.verifyJob = { cancelled: false, taskId: id, fileName: task.file, total: blocks.length, checked: 0, mismatches: 0, startTime: Date.now() };
 		try {
 			const checkOne = async b => {
 				const ax = origin.x + b.x, ay = origin.y + b.y, az = origin.z + b.z;
@@ -937,8 +987,12 @@ class Litematic {
 						if (attempt < 2) await delay(300); // 超时/丢命令 → 稍等后重试
 					}
 				}
-				if (!matched) mismatches.push({ x: ax, y: ay, z: az, expect: b.identifier, cmd: b.cmd || b.identifier });
+				if (!matched) {
+					mismatches.push({ x: ax, y: ay, z: az, expect: b.identifier, cmd: b.cmd || b.identifier });
+					this.verifyJob.mismatches = mismatches.length; // 同步差异数供 $status
+				}
 				checked++;
+				this.verifyJob.checked = checked; // 同步检查进度供 $status
 			};
 			// 分批并发执行，每批 CONC 个；每 500 块报告一次进度
 			for (let i = 0; i < blocks.length && !this.verifyJob.cancelled; i += CONC) {
@@ -988,22 +1042,28 @@ class Litematic {
 			const conn = c.ws || c;
 			if (!conn || conn.readyState !== WebSocket.OPEN) return c.tell("§c修复世界差异需要游戏连接（先 /connect 再使用）", sender);
 			const CONC = 4; // 并发放置（避免一次发太多命令被限流）
-			const placeOne = async m => {
-				const idn = m.expect.replace(/^minecraft:/, "");
-				// m.cmd 含方块状态（如 stair ["upside_down_bit"=true]），setblock 带状态才能恢复正/倒楼梯、朝向
-				const cmd = `/setblock ${m.x} ${m.y} ${m.z} ${m.cmd || idn}`;
-				for (let attempt = 0; attempt < 3; attempt++) {
-					try {
-						const d = await c.runCommand(cmd, 3000);
-						if (d?.body?.statusCode === 0) { fixed.push(`§7(${m.x},${m.y},${m.z}) §f→ §e${idn}`); return; }
-					} catch {}
-					await delay(300); // 失败或超时 → 稍等后重试
+			this.fixJob = { cancelled: false, taskId: id, fileName: task.file, total: mismatches.length, done: 0, startTime: Date.now() };
+			try {
+				const placeOne = async m => {
+					const idn = m.expect.replace(/^minecraft:/, "");
+					// m.cmd 含方块状态（如 stair ["upside_down_bit"=true]），setblock 带状态才能恢复正/倒楼梯、朝向
+					const cmd = `/setblock ${m.x} ${m.y} ${m.z} ${m.cmd || idn}`;
+					for (let attempt = 0; attempt < 3; attempt++) {
+						try {
+							const d = await c.runCommand(cmd, 3000);
+							if (d?.body?.statusCode === 0) { fixed.push(`§7(${m.x},${m.y},${m.z}) §f→ §e${idn}`); this.fixJob.done++; return; }
+						} catch {}
+						await delay(300); // 失败或超时 → 稍等后重试
+					}
+					failed.push(m); // 重试仍失败 → 保留差异，供再次 $fix
+					this.fixJob.done++;
+				};
+				for (let i = 0; i < mismatches.length && !this.fixJob.cancelled; i += CONC) {
+					await Promise.all(mismatches.slice(i, i + CONC).map(placeOne));
 				}
-				failed.push(m); // 重试仍失败 → 保留差异，供再次 $fix
-			};
-			for (let i = 0; i < mismatches.length; i += CONC) {
-				await Promise.all(mismatches.slice(i, i + CONC).map(placeOne));
-			}
+				// 中断时未处理的差异保留，供再次 $fix 继续
+				for (let i = this.fixJob.done; i < mismatches.length; i++) failed.push(mismatches[i]);
+			} finally { this.fixJob = null; }
 			task.mismatches = failed; // 未成功的差异保留，再次 $fix 继续修复
 		}
 		// ② 修复无法映射的方块（更新任务数据，供 $y 导入）
@@ -1056,7 +1116,7 @@ class Litematic {
 		this.previewData = { origin, data, file };
 		this.spawnPreviewEntities();
 		this.spawnPreviewParticles();
-		this.previewTimer = setInterval(() => this.spawnPreviewParticles(), 4000);
+		this.previewTimer = setInterval(() => this.spawnPreviewParticles(), 1500); // 末地烛粒子持续发光，加快刷新增强亮度
 		c.tell(
 			`§a已生成预览: §b${file} §f尺寸 §e${data.sx}§f×§e${data.sy}§f×§e${data.sz}\n` +
 			`§f范围: §7(${origin.x}, ${origin.y}, ${origin.z}) §f→ §7(${origin.x + data.sx - 1}, ${origin.y + data.sy - 1}, ${origin.z + data.sz - 1})\n` +
@@ -1109,7 +1169,7 @@ class Litematic {
 		const { origin, data } = this.previewData;
 		const x1 = origin.x, y1 = origin.y, z1 = origin.z;
 		const x2 = x1 + data.sx - 1, y2 = y1 + data.sy - 1, z2 = z1 + data.sz - 1;
-		const step = Math.max(4, Math.ceil(Math.max(data.sx, data.sy, data.sz) / 40));
+		const step = Math.max(3, Math.ceil(Math.max(data.sx, data.sy, data.sz) / 60)); // 末地烛粒子更密集
 		// 底边 4 条 + 立柱 4 条（顶部省略，避免粒子过多）
 		const edges = Litematic.previewEdges(x1, y1, z1, x2, y2, z2).slice(0, 8);
 		for (const [a, b] of edges) {
@@ -1117,7 +1177,7 @@ class Litematic {
 			const len = Math.max(Math.abs(dx), Math.abs(dy), Math.abs(dz));
 			const n = Math.floor(len / step);
 			for (let i = 0; i <= n; i++) {
-				c.sendCommand(`/particle minecraft:lava_particle ${a[0] + dx * i / n + 0.5} ${a[1] + dy * i / n + 0.5} ${a[2] + dz * i / n + 0.5}`);
+				c.sendCommand(`/particle minecraft:endrod ${a[0] + dx * i / n + 0.5} ${a[1] + dy * i / n + 0.5} ${a[2] + dz * i / n + 0.5}`);
 			}
 		}
 	}
@@ -1151,8 +1211,12 @@ class Litematic {
 	}
 	destroy() {
 		if (this.job) this.job.cancelled = true;
+		if (this.verifyJob) this.verifyJob.cancelled = true;
+		if (this.fixJob) this.fixJob.cancelled = true;
 		this.pending = null;
 		this.job = null;
+		this.verifyJob = null;
+		this.fixJob = null;
 		this.clearPreview();
 		this.client = null;
 	}
